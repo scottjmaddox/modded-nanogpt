@@ -2,6 +2,7 @@ import os
 import sys
 with open(sys.argv[0]) as f:
     code = f.read() # read the code of this file ASAP, for logging
+import math
 import uuid
 import glob
 import time
@@ -24,7 +25,7 @@ create_block_mask = torch.compile(create_block_mask, dynamic=False)
 
 def zeropower_via_svd(G, steps=None):
     U, S, V = G.svd()
-    return U @ V.T
+    return U @ V.mT
 
 @torch.compile
 def zeropower_via_newtonschulz5(G, steps=10, eps=1e-7):
@@ -37,18 +38,18 @@ def zeropower_via_newtonschulz5(G, steps=10, eps=1e-7):
     where S' is diagonal with S_{ii}' ~ Uniform(0.5, 1.5), which turns out not to hurt model
     performance at all relative to UV^T, where USV^T = G is the SVD.
     """
-    assert len(G.shape) == 2
+    assert G.ndim == 2 or G.ndim == 3
     a, b, c = (3.4445, -4.7750,  2.0315)
     X = G.bfloat16()
-    X /= (X.norm() + eps) # ensure top singular value <= 1
+    X /= (X.norm(dim=(-2, -1), keepdim=True) + eps) # ensure top singular value <= 1
     if G.size(0) > G.size(1):
-        X = X.T
+        X = X.mT
     for _ in range(steps):
-        A = X @ X.T
+        A = X @ X.mT
         B = b * A + c * A @ A # adapted from suggestion by @jxbz, @leloykun, and @YouJiacheng
         X = a * X + B @ X
     if G.size(0) > G.size(1):
-        X = X.T
+        X = X.mT
     return X
 
 zeropower_backends = dict(svd=zeropower_via_svd, newtonschulz5=zeropower_via_newtonschulz5)
@@ -168,9 +169,12 @@ class CausalSelfAttention(nn.Module):
         self.n_embd = config.n_embd
         self.head_dim = self.n_embd // self.n_head
         assert self.n_embd % self.n_head == 0
-        self.c_q = CastedLinear(self.n_embd, self.n_embd, bias=False)
-        self.c_k = CastedLinear(self.n_embd, self.n_embd, bias=False)
-        self.c_v = CastedLinear(self.n_embd, self.n_embd, bias=False)
+        self.c_q = nn.Parameter(torch.empty(self.n_head, self.head_dim, self.n_embd))
+        self.c_k = nn.Parameter(torch.empty(self.n_head, self.head_dim, self.n_embd))
+        self.c_v = nn.Parameter(torch.empty(self.n_head, self.head_dim, self.n_embd))
+        nn.init.kaiming_uniform_(self.c_q, a=math.sqrt(5))
+        nn.init.kaiming_uniform_(self.c_k, a=math.sqrt(5))
+        nn.init.kaiming_uniform_(self.c_v, a=math.sqrt(5))
         # output projection
         self.c_proj = CastedLinear(self.n_embd, self.n_embd, bias=False)
         self.c_proj.weight.data.zero_() # zero init suggested by @Grad62304977
@@ -179,9 +183,9 @@ class CausalSelfAttention(nn.Module):
 
     def forward(self, x, v1, block_mask):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
-        q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
-        k = self.c_k(x).view(B, T, self.n_head, self.head_dim)
-        v = self.c_v(x).view(B, T, self.n_head, self.head_dim)
+        q = F.linear(x, self.c_q.to(x.dtype).view(self.n_embd, self.n_embd)).view(B, T, self.n_head, self.head_dim)
+        k = F.linear(x, self.c_k.to(x.dtype).view(self.n_embd, self.n_embd)).view(B, T, self.n_head, self.head_dim)
+        v = F.linear(x, self.c_v.to(x.dtype).view(self.n_embd, self.n_embd)).view(B, T, self.n_head, self.head_dim)
         if v1 is None:
             v1 = v # This happens if we are in the first block. v needs to be accessed by subsequent blocks
         v = (1 - self.lamb) * v + self.lamb * v1.view_as(v) # @Grad62304977
@@ -461,7 +465,7 @@ enable_math_sdp(False)
 optimizer1 = torch.optim.Adam([raw_model.transformer.wte.weight], lr=0.6,   betas=(0.9, 0.95), fused=True)
 optimizer2 = torch.optim.Adam([raw_model.lm_head.weight],         lr=0.008, betas=(0.9, 0.95), fused=True)
 params = list(raw_model.transformer.h.parameters())
-matrix_params = [p for p in params if p.ndim == 2]
+matrix_params = [p for p in params if p.ndim == 2 or p.ndim == 3]
 scalar_params = [p for p in params if p.ndim < 2] + [raw_model.skip_weights]
 optimizer3 = Muon(matrix_params, lr=0.04, momentum=0.95)
 optimizer4 = torch.optim.Adam(scalar_params, lr=0.04, betas=(0.9, 0.95), fused=True) # note that this learning rate is neither sensitive nor tuned
