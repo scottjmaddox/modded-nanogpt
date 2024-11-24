@@ -145,6 +145,8 @@ class Rotary(torch.nn.Module):
             freqs = torch.outer(t, self.inv_freq)
             self.cos_cached = freqs.cos().bfloat16()
             self.sin_cached = freqs.sin().bfloat16()
+            self.cos_cached[..., self.dim//4:].fill_(1.0)  # No rotation for low frequencies
+            self.sin_cached[..., self.dim//4:].fill_(0.0)  # No phase shift for low frequencies
         return self.cos_cached[None, :, None, :], self.sin_cached[None, :, None, :]
 
 def apply_rotary_emb(x, cos, sin):
