@@ -177,7 +177,7 @@ class CausalSelfAttention(nn.Module):
         self.rotary = Rotary(self.head_dim)
         self.lamb = nn.Parameter(torch.tensor(0.5)) # @Grad62304977
 
-    def forward(self, x, v1, block_mask):
+    def forward(self, x, v1, score_mod, block_mask):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
         q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
         k = self.c_k(x).view(B, T, self.n_head, self.head_dim)
@@ -188,7 +188,6 @@ class CausalSelfAttention(nn.Module):
         cos, sin = self.rotary(q)
         q, k = F.rms_norm(q, (q.size(-1),)), F.rms_norm(k, (k.size(-1),)) # QK norm suggested by @Grad62304977
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
-        score_mod = lambda score, b, h, q_idx, kv_idx: 20 * torch.tanh(score / 20)
         y = flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), score_mod=score_mod, block_mask=block_mask)
         y = y.transpose(1, 2).contiguous().view_as(x) # re-assemble all head outputs side by side
         y = self.c_proj(y)
@@ -216,9 +215,9 @@ class Block(nn.Module):
         self.mlp = MLP(config)
         self.lambdas = nn.Parameter(torch.tensor([1., 0.]))
 
-    def forward(self, x, v1, x0, block_mask):
+    def forward(self, x, v1, x0, score_mod, block_mask):
         x = self.lambdas[0] * x + self.lambdas[1] * x0
-        x1, v1 = self.attn(F.rms_norm(x, (x.size(-1),)), v1, block_mask)
+        x1, v1 = self.attn(F.rms_norm(x, (x.size(-1),)), v1, score_mod, block_mask)
         x = x + x1
         x = x + self.mlp(F.rms_norm(x, (x.size(-1),)))
         return x, v1
@@ -250,6 +249,7 @@ class GPT(nn.Module):
         ))
         self.lm_head = CastedLinear(config.n_embd, config.vocab_size, bias=False)
         self.lm_head.weight.data.zero_() # @Grad62304977
+        self.score_mod = lambda score, b, h, q_idx, kv_idx: 20 * torch.tanh(score / 20)
 
     def forward(self, idx, target):
 
@@ -273,12 +273,12 @@ class GPT(nn.Module):
         skip_connections = []
         # Encoder pass - process only the first half of the blocks
         for i in range(self.num_encoder_layers):
-            x, v1 = self.transformer.h[i](x, v1, x0, block_mask)
+            x, v1 = self.transformer.h[i](x, v1, x0, self.score_mod, block_mask)
             skip_connections.append(x)
         # Decoder pass - process the remaining blocks with weighted skip connections
         for i in range(self.num_decoder_layers):
             x = x + self.skip_weights[i] * skip_connections.pop()
-            x, v1 = self.transformer.h[self.num_encoder_layers + i](x, v1, x0, block_mask)
+            x, v1 = self.transformer.h[self.num_encoder_layers + i](x, v1, x0, self.score_mod, block_mask)
 
         x = F.rms_norm(x, (x.size(-1),))
         logits = self.lm_head(x)
