@@ -160,6 +160,35 @@ class CastedLinear(nn.Linear):
     def forward(self, x):
         return F.linear(x, self.weight.to(x.dtype))
 
+def parallel_scan_log(log_coeffs, log_values):
+    # log_coeffs: (batch_size, seq_len, n_embd)
+    # log_values: (batch_size, seq_len + 1, n_embd)
+    a_star = F.pad(torch.cumsum(log_coeffs, dim=-1), (0, 0, 1, 0))
+    log_h0_plus_b_star = torch.logcumsumexp(log_values - a_star, dim=1)
+    log_h = a_star + log_h0_plus_b_star
+    return log_h[..., 1:, :]  # (batch_size, seq_len, n_embd)
+
+def log_g(x):
+    return torch.where(x >= 0, (F.relu(x)+0.5).log(), -F.softplus(-x))
+
+class MinGRU(torch.nn.Module):
+    def __init__(self, n_embd):
+        super().__init__()
+        self.init_state = torch.nn.Parameter(F.rms_norm(torch.randn(n_embd), (n_embd,)))
+        self.to_gate = CastedLinear(n_embd, n_embd, bias=False)
+        self.to_candidate_state = CastedLinear(n_embd, n_embd, bias=False)
+        self.to_out = CastedLinear(n_embd, n_embd, bias=False)
+        self.to_out.weight.data.zero_()
+
+    def forward(self, x):
+        log_z = -F.softplus(self.to_gate(-x))
+        log_coeffs = -F.softplus(self.to_gate(x))
+        log_h0 = log_g(self.init_state).expand(x.size(0), 1, -1)
+        log_tilde_h = log_g(self.to_candidate_state(x))
+        log_values = torch.cat([log_h0, log_z + log_tilde_h], dim=1)
+        log_h = parallel_scan_log(log_coeffs, log_values)
+        return self.to_out(log_h.exp())
+
 class CausalSelfAttention(nn.Module):
 
     def __init__(self, config):
@@ -211,15 +240,19 @@ class Block(nn.Module):
 
     def __init__(self, config):
         super().__init__()
+        self.mingru = MinGRU(config.n_embd)
+        self.mlp1 = MLP(config)
         self.attn = CausalSelfAttention(config)
-        self.mlp = MLP(config)
+        self.mlp2 = MLP(config)
         self.lambdas = nn.Parameter(torch.tensor([1., 0.]))
 
     def forward(self, x, v1, x0, block_mask):
         x = self.lambdas[0] * x + self.lambdas[1] * x0
+        x = x + self.mingru(F.rms_norm(x, (x.size(-1),)))
+        x = x + self.mlp1(F.rms_norm(x, (x.size(-1),)))
         x1, v1 = self.attn(F.rms_norm(x, (x.size(-1),)), v1, block_mask)
         x = x + x1
-        x = x + self.mlp(F.rms_norm(x, (x.size(-1),)))
+        x = x + self.mlp2(F.rms_norm(x, (x.size(-1),)))
         return x, v1
 
 # -----------------------------------------------------------------------------
@@ -438,13 +471,16 @@ x, y = train_loader.next_batch()
 # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency. suggested to me by @Grad62304977.
 # this originates from Karpathy's experiments.
 num_vocab = 50304
-model = GPT(GPTConfig(vocab_size=num_vocab, n_layer=12, n_head=6, n_embd=768))
+model = GPT(GPTConfig(vocab_size=num_vocab, n_layer=6, n_head=6, n_embd=768))
 model = model.cuda().bfloat16()
 for m in model.modules():
     if isinstance(m, CastedLinear):
         m.float()
 if hasattr(config, "coordinate_descent_tuning"):
     config.coordinate_descent_tuning = True # suggested by @Chillee
+num_params = sum(p.numel() for p in model.parameters())
+num_embed_params = model.transformer.wte.weight.numel()
+print0(f"Non-embedding params: {num_params - num_embed_params} (embedding: {num_embed_params})")
 model = torch.compile(model)
 # here we wrap model into DDP container
 model = DDP(model, device_ids=[ddp_local_rank])
