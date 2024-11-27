@@ -7,6 +7,7 @@ import glob
 import time
 import contextlib
 from dataclasses import dataclass
+import math
 
 import numpy as np
 import torch
@@ -104,13 +105,14 @@ class Muon(torch.optim.Optimizer):
                     state = self.state[p]
                     if 'momentum_buffer' not in state:
                         state['momentum_buffer'] = torch.zeros_like(g)
-                    buf = state['momentum_buffer']
+                    u = buf = state['momentum_buffer']
                     buf.mul_(momentum).add_(g)
                     if group['nesterov']:
-                        g = g.add(buf, alpha=momentum)
-                    g = zeropower_backend(g, steps=group['backend_steps'])
-                    g *= max(1, g.size(0)/g.size(1))**0.5
-                    updates_flat[curr_idx:curr_idx+p.numel()] = g.flatten()
+                        u = g.add(buf, alpha=momentum)
+                    u *= (u * g > 0).type_as(u) # TODO: apply after orthogonalization?
+                    u = zeropower_backend(u, steps=group['backend_steps'])
+                    u *= max(1, math.sqrt(u.size(0)/u.size(1)))
+                    updates_flat[curr_idx:curr_idx+p.numel()] = u.flatten()
                 curr_idx += p.numel()
 
             # sync updates across devices. we are not memory-constrained so can do this simple deserialization
@@ -119,8 +121,8 @@ class Muon(torch.optim.Optimizer):
             # deserialize and apply updates
             curr_idx = 0
             for p in group['params']:
-                g = updates_flat[curr_idx:curr_idx+p.numel()].view_as(p.data).type_as(p.data)
-                p.data.add_(g, alpha=-lr)
+                u = updates_flat[curr_idx:curr_idx+p.numel()].view_as(p.data).type_as(p.data)
+                p.data.add_(u, alpha=-lr)
                 curr_idx += p.numel()
 
 # -----------------------------------------------------------------------------
