@@ -184,21 +184,21 @@ class CausalSelfAttention(nn.Module):
         self.c_proj = CastedLinear(dim, dim)
         self.c_proj.weight.data.zero_() # zero init suggested by @Grad62304977
 
-    def forward(self, x, v1, block_mask):
+    def forward(self, x, vres, block_mask):
         B, T = x.size(0), x.size(1) # batch size, sequence length
         assert B == 1, "Must use batch size = 1 for FlexAttention"
         q = self.c_q(x).view(B, T, self.n_head, -1)
         k = self.c_k(x).view(B, T, self.n_head, -1)
         v = self.c_v(x).view(B, T, self.n_head, -1)
-        if v1 is None:
-            v1 = v # This happens if we are in the first block. v needs to be accessed by subsequent blocks
-        v = (1 - self.lamb) * v + self.lamb * v1.view_as(v) # @Grad62304977
+        if vres is None:
+            vres = v # This happens if we are in the first block. v needs to be accessed by subsequent blocks
+        v = (1 - self.lamb) * v + self.lamb * vres # @Grad62304977
         q, k = norm(q), norm(k) # QK norm suggested by @Grad62304977
         q, k = self.rotary(q), self.rotary(k)
         y = flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=block_mask)
         y = y.transpose(1, 2).contiguous().view_as(x) # re-assemble all head outputs side by side
         y = self.c_proj(y)
-        return y, v1
+        return y, v
 
 class MLP(nn.Module):
 
@@ -222,12 +222,12 @@ class Block(nn.Module):
         self.mlp = MLP(config.n_embd)
         self.lambdas = nn.Parameter(torch.tensor([1., 0.]))
 
-    def forward(self, x, v1, x0, block_mask):
+    def forward(self, x, vres, x0, block_mask):
         x = self.lambdas[0] * x + self.lambdas[1] * x0
-        x1, v1 = self.attn(norm(x), v1, block_mask)
+        x1, vres = self.attn(norm(x), vres, block_mask)
         x = x + x1
         x = x + self.mlp(norm(x))
-        return x, v1
+        return x, vres
 
 # -----------------------------------------------------------------------------
 # The main GPT-2 model
@@ -273,18 +273,18 @@ class GPT(nn.Module):
         x = self.transformer.wte(idx[None]) # token embeddings of shape (b, t, n_embd)
         x = norm(x) # @Grad62304977
         x0 = x
-        v1 = None
+        vres = None
 
         # Store outputs for U-Net skip connections
         skip_connections = []
         # Encoder pass - process only the first half of the blocks
         for i in range(self.num_encoder_layers):
-            x, v1 = self.transformer.h[i](x, v1, x0, block_mask)
+            x, vres = self.transformer.h[i](x, vres, x0, block_mask)
             skip_connections.append(x)
         # Decoder pass - process the remaining blocks with weighted skip connections
         for i in range(self.num_decoder_layers):
             x = x + self.skip_weights[i] * skip_connections.pop()
-            x, v1 = self.transformer.h[self.num_encoder_layers + i](x, v1, x0, block_mask)
+            x, vres = self.transformer.h[self.num_encoder_layers + i](x, vres, x0, block_mask)
 
         x = norm(x)
         logits = self.lm_head(x)
