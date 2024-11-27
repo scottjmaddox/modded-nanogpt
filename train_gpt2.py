@@ -133,6 +133,8 @@ class CastedLinear(nn.Linear):
 
     def __init__(self, in_features, out_features):
         super().__init__(in_features, out_features, bias=False)
+        i = torch.randperm(in_features)[:int(0.9 * in_features)]
+        self.weight.data.index_fill_(-1, i, 0.0)
 
     def forward(self, x):
         return F.linear(x, self.weight.to(x.dtype))
